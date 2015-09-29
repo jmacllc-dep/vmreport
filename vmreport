@@ -17,10 +17,6 @@ Options:
          You must use the -l or --live option for real-time query. 
 
 """    
-# NOTE Disabled warnings on line 730 of
-# /opt/python-2.7.5/lib/python2.7/site-packages/requests/packages/urllib3/connectionpool.py for testing
-# PUT THIS BACK WHEN WE MOVE TO REGULAR USE!!!
-
 from pyzabbix import ZabbixAPI
 from docopt import docopt
 import os
