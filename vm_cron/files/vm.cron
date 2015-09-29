@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+/usr/bin/virsh list 2>&1 > /var/log/zabbix/vm_guests.txt
