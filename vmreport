@@ -1,0 +1,229 @@
+#!/usr/bin/env python2.7
+
+"""
+Usage: 
+    vmreport 
+    vmreport -l
+    vmreport (--jeff | -s) <hostname>
+
+Query Zabbix servers for host/vm info. 
+
+Options:
+  -h --help     Show this screen.
+  -l --live     Force live query of Zabbix server(s). 
+  -s --search   (OR --jeff) Search for a host/guest by name
+
+**NOTE** This script DEFAULTS to cached results. 
+         You must use the -l or --live option for real-time query. 
+
+"""    
+# NOTE Disabled warnings on line 730 of
+# /opt/python-2.7.5/lib/python2.7/site-packages/requests/packages/urllib3/connectionpool.py for testing
+# PUT THIS BACK WHEN WE MOVE TO REGULAR USE!!!
+
+from pyzabbix import ZabbixAPI
+from docopt import docopt
+import os
+import sys
+import datetime
+
+# Initialize API with READ ONLY user/pass
+zapi = ZabbixAPI("https://zabbix-prod.weather.com")
+zapi.session.verify = False
+zapi.login("zquery", "pyzabbix")
+
+devzapi = ZabbixAPI("https://zabbix.dev.weather.com")
+devzapi.session.verify = False
+devzapi.login("zquery", "pyzabbix")
+
+
+# Get JSON response from Zabbix server(s) for vm host groups.
+def get_vm_hosts():
+    host_list = []
+    prod_response = zapi.hostgroup.get(selectHosts=['name'],filter={'name':'ATL_OPS-VM_Hosts'})
+    prod_hosts = extract_hosts(prod_response)
+    dev_response = devzapi.hostgroup.get(selectHosts=['name'],filter={'name':'ATL_OPS-VM_Hosts'})
+    dev_hosts = extract_hosts(dev_response)
+    host_list.append(prod_hosts)
+    host_list.append(dev_hosts)
+    return host_list
+
+# Loop through JSON response to get hosts. 
+def extract_hosts(response):
+    host_list = []
+    for x in range(len(response)):
+        for host in response[x]['hosts']:
+            host_list.append(host['name'])
+    #print sorted(host_list)        
+    return sorted(host_list) 
+
+# Get JSON response containing the items associated with machines in vm host groups. 
+def get_vm_guests(host_list):
+    prod_response = zapi.host.get(selectItems=['lastvalue', 'name'], filter={"host":host_list[0]}) 
+    dev_response = devzapi.host.get(selectItems=['lastvalue', 'name'], filter={"host":host_list[1]})
+    prod_list = extract_guests(prod_response)
+    dev_list = extract_guests(dev_response)
+    host_list = prod_list + dev_list
+    return host_list
+    
+# Loop through JSON response to get the value of 'get_vm_guests' item. 
+def extract_guests(response):
+    hostname = ''
+    guests = ''
+    guest_list = []
+    for x in range(len(response)):
+        for item in response[x]['items']:
+            if item['name'] == 'Host name':
+                hostname = item['lastvalue']
+            elif item['name'] == 'get_vm_guests':
+                guests = item['lastvalue']
+        entry = hostname + ": " + guests
+        guest_list.append(entry)
+    
+    return sorted(guest_list) 
+
+def diff(a,b):
+    b = set(b)
+    return [str(line) for line in a if line not in b]
+
+# Any time we do a live query, go ahead and check the cached file for changes. 
+def check_cache(live_list):
+    DEBUG = False 
+    live_path = '/tmp/vmreport/'
+    debug_path = '/home/jsutterfield/vm_report/tmp/vmreport/'
+    
+    if DEBUG:
+        path = debug_path
+        print("vmreport is in DEBUG mode. Output will be written to " + debug_path)
+    else:
+        path = live_path
+        
+    # Compare cache file contents to Zabbix query results. 
+    if os.path.exists( path + 'vmreport.txt'):
+        with open( path + 'vmreport.txt', 'r') as vmreport:
+            cached_list = [line.rstrip('\n') for line in vmreport]
+        
+        # Compare lists and write new file if changes are found. 
+        if live_list != cached_list:
+            # We have changes. Update cache file with live data. 
+            print("Changes detected. Updating cache file..")
+            today = datetime.datetime.now()
+            suffix = "." + today.strftime("%m.%d.%y_%H:%M:%S") + ".txt"
+            with open( path + 'vmreport.txt', 'w') as vmreport:
+                for line in live_list:
+                    vmreport.write(line + '\n')
+
+            # Convert both lists to dicts and isolate change details.   
+            live_dict = {}
+            cached_dict = {}
+            for item in live_list:
+                line = item.split(' ')
+                key = line[0]
+                live_dict[key] = line[1:]
+            for item in cached_list:
+                line = item.split(' ')
+                key = line[0]
+                cached_dict[key] = line[1:]
+
+            # Compare keys to find host additions/deletions
+            host_updates = []
+            if set(live_dict.keys()) != set(cached_dict.keys()):
+                # See if host was ADDED since last run
+                hosts = diff(live_dict.keys(), cached_dict.keys())
+                if hosts:
+                    for host in hosts:
+                        line = '+HOST ' + host + ' ' + ' '.join(live_dict[host])
+                        host_updates.append(line)
+                # See if host was REMOVED since last run
+                hosts = diff(cached_dict.keys(), live_dict.keys())
+                if hosts: 
+                    for host in hosts:
+                        line = '-HOST ' + host + ' ' + ' '.join(cached_dict[host])
+                        host_updates.append(line)
+
+            # Compare values to find guest vm additions/deletions/migrations 
+            guest_updates = []
+            common = set.intersection(set(live_dict.keys()), set(cached_dict.keys()))
+            for key in common:
+                live = live_dict[key]
+                cached = cached_dict[key]
+                # See if guest was ADDED/MIGRATED since last run
+                guests = diff(live, cached)
+                if guests:
+                    for guest in guests:
+                        line = '+GUEST ' + key + ': ' + str(guest) 
+                        guest_updates.append(line)
+                # See if guest was REMOVED/MIGRATED since last run
+                guests = diff(cached, live)
+                if guests:
+                    for guest in guests:
+                        line = '-GUEST ' + key + ': ' + str(guest)
+                        guest_updates.append(line)
+
+            # Write changes to log
+            with open( path + 'vmreport_changelog' + suffix, 'w') as changelog:
+                changelog.write('VMREPORT: Changelog for ' + today.strftime("%m.%d.%y_%H:%M:%S") + '\n') 
+                if host_updates:
+                    for line in host_updates:
+                        changelog.write(line + '\n')
+                if guest_updates:
+                    for line in guest_updates:
+                        changelog.write(line + '\n')
+    else:
+        # No cache file. Generate one from our Zabbix query. 
+        host_list = get_vm_hosts()
+        live_list = get_vm_guests(host_list)
+        with open( path + 'vmreport.txt', 'w') as vmreport:
+            for line in live_list:
+                vmreport.write(line + '\n')
+
+def search(hostname):
+    dir_path = '/tmp/vmreport/'
+    names = os.listdir('/tmp/vmreport/')
+    full_path = []
+    for name in names:
+        file = str(dir_path + name)
+        full_path.append(file)
+    files = sorted(full_path, key=os.path.getctime)
+    files = files[::-1]
+    for file in files:
+        with open(file, 'r') as search_file:
+            for line in search_file:
+                if hostname in line:
+                    if 'vmreport.txt' in file:
+                        print("")
+                        print("Current status of " + hostname + ":")
+                        print("")
+                        print(file)
+                        print(line)
+                        print("")
+                        return
+                    else:
+                        print("")
+                        print("Last known status of " + hostname + ":")
+                        print("")
+                        print(file)
+                        print(line)
+                        print("")
+                        return
+
+if __name__ == "__main__":
+    args = docopt(__doc__)
+    
+    if args['--search'] or args['--jeff']:
+        search(args['<hostname>'])        
+        sys.exit(1)
+    
+    if args['--live']:
+        host_list = get_vm_hosts()
+        live_list = get_vm_guests(host_list)
+        for item in live_list:
+            print item
+        check_cache(live_list)
+    else:
+        if os.path.exists('/tmp/vmreport/vmreport.txt'):
+            with open('/tmp/vmreport/vmreport.txt', 'r') as vmreport:
+                print vmreport.read()
+        else:
+            print("ERROR: No cache file found at /tmp/vmreport/vmreport.txt")
+            print("Please run vmreport with -l option to generate cache file.")
